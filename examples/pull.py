@@ -1,9 +1,9 @@
 from tqdm import tqdm
+
 from ollama import pull
 
-
 current_digest, bars = '', {}
-for progress in pull('mistral', stream=True):
+for progress in pull('gemma3', stream=True):
   digest = progress.get('digest', '')
   if digest != current_digest and current_digest in bars:
     bars[current_digest].close()

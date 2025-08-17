@@ -1,15 +1,17 @@
-import os
-import io
-import json
-import platform
 import ipaddress
+import json
+import os
+import platform
+import sys
 import urllib.parse
+from hashlib import sha256
 from os import PathLike
 from pathlib import Path
-from hashlib import sha256
-
 from typing import (
   Any,
+  Callable,
+  Dict,
+  List,
   Literal,
   Mapping,
   Optional,
@@ -20,12 +22,15 @@ from typing import (
   overload,
 )
 
-import sys
+import anyio
+from pydantic.json_schema import JsonSchemaValue
+
+from ollama._utils import convert_function_to_tool
 
 if sys.version_info < (3, 9):
-  from typing import Iterator, AsyncIterator
+  from typing import AsyncIterator, Iterator
 else:
-  from collections.abc import Iterator, AsyncIterator
+  from collections.abc import AsyncIterator, Iterator
 
 from importlib import metadata
 
@@ -39,13 +44,13 @@ import httpx
 from ollama._types import (
   ChatRequest,
   ChatResponse,
-  CreateRequest,
   CopyRequest,
+  CreateRequest,
   DeleteRequest,
-  EmbedRequest,
-  EmbedResponse,
   EmbeddingsRequest,
   EmbeddingsResponse,
+  EmbedRequest,
+  EmbedResponse,
   GenerateRequest,
   GenerateResponse,
   Image,
@@ -56,14 +61,12 @@ from ollama._types import (
   ProgressResponse,
   PullRequest,
   PushRequest,
-  RequestError,
   ResponseError,
   ShowRequest,
   ShowResponse,
   StatusResponse,
   Tool,
 )
-
 
 T = TypeVar('T')
 
@@ -73,6 +76,7 @@ class BaseClient:
     self,
     client,
     host: Optional[str] = None,
+    *,
     follow_redirects: bool = True,
     timeout: Any = None,
     headers: Optional[Mapping[str, str]] = None,
@@ -104,17 +108,22 @@ class BaseClient:
     )
 
 
+CONNECTION_ERROR_MESSAGE = 'Failed to connect to Ollama. Please check that Ollama is downloaded, running and accessible. https://ollama.com/download'
+
+
 class Client(BaseClient):
   def __init__(self, host: Optional[str] = None, **kwargs) -> None:
     super().__init__(httpx.Client, host, **kwargs)
 
   def _request_raw(self, *args, **kwargs):
-    r = self._client.request(*args, **kwargs)
     try:
+      r = self._client.request(*args, **kwargs)
       r.raise_for_status()
+      return r
     except httpx.HTTPStatusError as e:
       raise ResponseError(e.response.text, e.response.status_code) from None
-    return r
+    except httpx.ConnectError:
+      raise ConnectionError(CONNECTION_ERROR_MESSAGE) from None
 
   @overload
   def _request(
@@ -181,9 +190,10 @@ class Client(BaseClient):
     template: str = '',
     context: Optional[Sequence[int]] = None,
     stream: Literal[False] = False,
+    think: Optional[bool] = None,
     raw: bool = False,
-    format: Optional[Literal['', 'json']] = None,
-    images: Optional[Sequence[Union[str, bytes]]] = None,
+    format: Optional[Union[Literal['', 'json'], JsonSchemaValue]] = None,
+    images: Optional[Sequence[Union[str, bytes, Image]]] = None,
     options: Optional[Union[Mapping[str, Any], Options]] = None,
     keep_alive: Optional[Union[float, str]] = None,
   ) -> GenerateResponse: ...
@@ -199,9 +209,10 @@ class Client(BaseClient):
     template: str = '',
     context: Optional[Sequence[int]] = None,
     stream: Literal[True] = True,
+    think: Optional[bool] = None,
     raw: bool = False,
-    format: Optional[Literal['', 'json']] = None,
-    images: Optional[Sequence[Union[str, bytes]]] = None,
+    format: Optional[Union[Literal['', 'json'], JsonSchemaValue]] = None,
+    images: Optional[Sequence[Union[str, bytes, Image]]] = None,
     options: Optional[Union[Mapping[str, Any], Options]] = None,
     keep_alive: Optional[Union[float, str]] = None,
   ) -> Iterator[GenerateResponse]: ...
@@ -216,9 +227,10 @@ class Client(BaseClient):
     template: Optional[str] = None,
     context: Optional[Sequence[int]] = None,
     stream: bool = False,
+    think: Optional[bool] = None,
     raw: Optional[bool] = None,
-    format: Optional[Literal['', 'json']] = None,
-    images: Optional[Sequence[Union[str, bytes]]] = None,
+    format: Optional[Union[Literal['', 'json'], JsonSchemaValue]] = None,
+    images: Optional[Sequence[Union[str, bytes, Image]]] = None,
     options: Optional[Union[Mapping[str, Any], Options]] = None,
     keep_alive: Optional[Union[float, str]] = None,
   ) -> Union[GenerateResponse, Iterator[GenerateResponse]]:
@@ -244,9 +256,10 @@ class Client(BaseClient):
         template=template,
         context=context,
         stream=stream,
+        think=think,
         raw=raw,
         format=format,
-        images=[Image(value=image) for image in images] if images else None,
+        images=list(_copy_images(images)) if images else None,
         options=options,
         keep_alive=keep_alive,
       ).model_dump(exclude_none=True),
@@ -259,9 +272,10 @@ class Client(BaseClient):
     model: str = '',
     messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None,
     *,
-    tools: Optional[Sequence[Union[Mapping[str, Any], Tool]]] = None,
+    tools: Optional[Sequence[Union[Mapping[str, Any], Tool, Callable]]] = None,
     stream: Literal[False] = False,
-    format: Optional[Literal['', 'json']] = None,
+    think: Optional[Union[bool, Literal['low', 'medium', 'high']]] = None,
+    format: Optional[Union[Literal['', 'json'], JsonSchemaValue]] = None,
     options: Optional[Union[Mapping[str, Any], Options]] = None,
     keep_alive: Optional[Union[float, str]] = None,
   ) -> ChatResponse: ...
@@ -272,9 +286,10 @@ class Client(BaseClient):
     model: str = '',
     messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None,
     *,
-    tools: Optional[Sequence[Union[Mapping[str, Any], Tool]]] = None,
+    tools: Optional[Sequence[Union[Mapping[str, Any], Tool, Callable]]] = None,
     stream: Literal[True] = True,
-    format: Optional[Literal['', 'json']] = None,
+    think: Optional[Union[bool, Literal['low', 'medium', 'high']]] = None,
+    format: Optional[Union[Literal['', 'json'], JsonSchemaValue]] = None,
     options: Optional[Union[Mapping[str, Any], Options]] = None,
     keep_alive: Optional[Union[float, str]] = None,
   ) -> Iterator[ChatResponse]: ...
@@ -284,14 +299,39 @@ class Client(BaseClient):
     model: str = '',
     messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None,
     *,
-    tools: Optional[Sequence[Union[Mapping[str, Any], Tool]]] = None,
+    tools: Optional[Sequence[Union[Mapping[str, Any], Tool, Callable]]] = None,
     stream: bool = False,
-    format: Optional[Literal['', 'json']] = None,
+    think: Optional[Union[bool, Literal['low', 'medium', 'high']]] = None,
+    format: Optional[Union[Literal['', 'json'], JsonSchemaValue]] = None,
     options: Optional[Union[Mapping[str, Any], Options]] = None,
     keep_alive: Optional[Union[float, str]] = None,
   ) -> Union[ChatResponse, Iterator[ChatResponse]]:
     """
     Create a chat response using the requested model.
+
+    Args:
+      tools:
+        A JSON schema as a dict, an Ollama Tool or a Python Function.
+        Python functions need to follow Google style docstrings to be converted to an Ollama Tool.
+        For more information, see: https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings
+      stream: Whether to stream the response.
+      format: The format of the response.
+
+    Example:
+      def add_two_numbers(a: int, b: int) -> int:
+        '''
+        Add two numbers together.
+
+        Args:
+          a: First number to add
+          b: Second number to add
+
+        Returns:
+          int: The sum of a and b
+        '''
+        return a + b
+
+      client.chat(model='llama3.2', tools=[add_two_numbers], messages=[...])
 
     Raises `RequestError` if a model is not provided.
 
@@ -299,16 +339,16 @@ class Client(BaseClient):
 
     Returns `ChatResponse` if `stream` is `False`, otherwise returns a `ChatResponse` generator.
     """
-
     return self._request(
       ChatResponse,
       'POST',
       '/api/chat',
       json=ChatRequest(
         model=model,
-        messages=[message for message in _copy_messages(messages)],
-        tools=[tool for tool in _copy_tools(tools)],
+        messages=list(_copy_messages(messages)),
+        tools=list(_copy_tools(tools)),
         stream=stream,
+        think=think,
         format=format,
         options=options,
         keep_alive=keep_alive,
@@ -447,10 +487,16 @@ class Client(BaseClient):
   def create(
     self,
     model: str,
-    path: Optional[Union[str, PathLike]] = None,
-    modelfile: Optional[str] = None,
-    *,
     quantize: Optional[str] = None,
+    from_: Optional[str] = None,
+    files: Optional[Dict[str, str]] = None,
+    adapters: Optional[Dict[str, str]] = None,
+    template: Optional[str] = None,
+    license: Optional[Union[str, List[str]]] = None,
+    system: Optional[str] = None,
+    parameters: Optional[Union[Mapping[str, Any], Options]] = None,
+    messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None,
+    *,
     stream: Literal[False] = False,
   ) -> ProgressResponse: ...
 
@@ -458,20 +504,32 @@ class Client(BaseClient):
   def create(
     self,
     model: str,
-    path: Optional[Union[str, PathLike]] = None,
-    modelfile: Optional[str] = None,
-    *,
     quantize: Optional[str] = None,
+    from_: Optional[str] = None,
+    files: Optional[Dict[str, str]] = None,
+    adapters: Optional[Dict[str, str]] = None,
+    template: Optional[str] = None,
+    license: Optional[Union[str, List[str]]] = None,
+    system: Optional[str] = None,
+    parameters: Optional[Union[Mapping[str, Any], Options]] = None,
+    messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None,
+    *,
     stream: Literal[True] = True,
   ) -> Iterator[ProgressResponse]: ...
 
   def create(
     self,
     model: str,
-    path: Optional[Union[str, PathLike]] = None,
-    modelfile: Optional[str] = None,
-    *,
     quantize: Optional[str] = None,
+    from_: Optional[str] = None,
+    files: Optional[Dict[str, str]] = None,
+    adapters: Optional[Dict[str, str]] = None,
+    template: Optional[str] = None,
+    license: Optional[Union[str, List[str]]] = None,
+    system: Optional[str] = None,
+    parameters: Optional[Union[Mapping[str, Any], Options]] = None,
+    messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None,
+    *,
     stream: bool = False,
   ) -> Union[ProgressResponse, Iterator[ProgressResponse]]:
     """
@@ -479,45 +537,27 @@ class Client(BaseClient):
 
     Returns `ProgressResponse` if `stream` is `False`, otherwise returns a `ProgressResponse` generator.
     """
-    if (realpath := _as_path(path)) and realpath.exists():
-      modelfile = self._parse_modelfile(realpath.read_text(), base=realpath.parent)
-    elif modelfile:
-      modelfile = self._parse_modelfile(modelfile)
-    else:
-      raise RequestError('must provide either path or modelfile')
-
     return self._request(
       ProgressResponse,
       'POST',
       '/api/create',
       json=CreateRequest(
         model=model,
-        modelfile=modelfile,
         stream=stream,
         quantize=quantize,
+        from_=from_,
+        files=files,
+        adapters=adapters,
+        license=license,
+        template=template,
+        system=system,
+        parameters=parameters,
+        messages=messages,
       ).model_dump(exclude_none=True),
       stream=stream,
     )
 
-  def _parse_modelfile(self, modelfile: str, base: Optional[Path] = None) -> str:
-    base = Path.cwd() if base is None else base
-
-    out = io.StringIO()
-    for line in io.StringIO(modelfile):
-      command, _, args = line.partition(' ')
-      if command.upper() not in ['FROM', 'ADAPTER']:
-        print(line, end='', file=out)
-        continue
-
-      path = Path(args.strip()).expanduser()
-      path = path if path.is_absolute() else base / path
-      if path.exists():
-        args = f'@{self._create_blob(path)}\n'
-      print(command, args, end='', file=out)
-
-    return out.getvalue()
-
-  def _create_blob(self, path: Union[str, Path]) -> str:
+  def create_blob(self, path: Union[str, Path]) -> str:
     sha256sum = sha256()
     with open(path, 'rb') as r:
       while True:
@@ -529,7 +569,7 @@ class Client(BaseClient):
     digest = f'sha256:{sha256sum.hexdigest()}'
 
     with open(path, 'rb') as r:
-      self._request_raw('POST', f'/api/blobs/sha256:{digest}', content=r)
+      self._request_raw('POST', f'/api/blobs/{digest}', content=r)
 
     return digest
 
@@ -588,12 +628,14 @@ class AsyncClient(BaseClient):
     super().__init__(httpx.AsyncClient, host, **kwargs)
 
   async def _request_raw(self, *args, **kwargs):
-    r = await self._client.request(*args, **kwargs)
     try:
+      r = await self._client.request(*args, **kwargs)
       r.raise_for_status()
+      return r
     except httpx.HTTPStatusError as e:
       raise ResponseError(e.response.text, e.response.status_code) from None
-    return r
+    except httpx.ConnectError:
+      raise ConnectionError(CONNECTION_ERROR_MESSAGE) from None
 
   @overload
   async def _request(
@@ -660,9 +702,10 @@ class AsyncClient(BaseClient):
     template: str = '',
     context: Optional[Sequence[int]] = None,
     stream: Literal[False] = False,
+    think: Optional[Union[bool, Literal['low', 'medium', 'high']]] = None,
     raw: bool = False,
-    format: Optional[Literal['', 'json']] = None,
-    images: Optional[Sequence[Union[str, bytes]]] = None,
+    format: Optional[Union[Literal['', 'json'], JsonSchemaValue]] = None,
+    images: Optional[Sequence[Union[str, bytes, Image]]] = None,
     options: Optional[Union[Mapping[str, Any], Options]] = None,
     keep_alive: Optional[Union[float, str]] = None,
   ) -> GenerateResponse: ...
@@ -678,9 +721,10 @@ class AsyncClient(BaseClient):
     template: str = '',
     context: Optional[Sequence[int]] = None,
     stream: Literal[True] = True,
+    think: Optional[Union[bool, Literal['low', 'medium', 'high']]] = None,
     raw: bool = False,
-    format: Optional[Literal['', 'json']] = None,
-    images: Optional[Sequence[Union[str, bytes]]] = None,
+    format: Optional[Union[Literal['', 'json'], JsonSchemaValue]] = None,
+    images: Optional[Sequence[Union[str, bytes, Image]]] = None,
     options: Optional[Union[Mapping[str, Any], Options]] = None,
     keep_alive: Optional[Union[float, str]] = None,
   ) -> AsyncIterator[GenerateResponse]: ...
@@ -695,9 +739,10 @@ class AsyncClient(BaseClient):
     template: Optional[str] = None,
     context: Optional[Sequence[int]] = None,
     stream: bool = False,
+    think: Optional[Union[bool, Literal['low', 'medium', 'high']]] = None,
     raw: Optional[bool] = None,
-    format: Optional[Literal['', 'json']] = None,
-    images: Optional[Sequence[Union[str, bytes]]] = None,
+    format: Optional[Union[Literal['', 'json'], JsonSchemaValue]] = None,
+    images: Optional[Sequence[Union[str, bytes, Image]]] = None,
     options: Optional[Union[Mapping[str, Any], Options]] = None,
     keep_alive: Optional[Union[float, str]] = None,
   ) -> Union[GenerateResponse, AsyncIterator[GenerateResponse]]:
@@ -722,9 +767,10 @@ class AsyncClient(BaseClient):
         template=template,
         context=context,
         stream=stream,
+        think=think,
         raw=raw,
         format=format,
-        images=[Image(value=image) for image in images] if images else None,
+        images=list(_copy_images(images)) if images else None,
         options=options,
         keep_alive=keep_alive,
       ).model_dump(exclude_none=True),
@@ -737,9 +783,10 @@ class AsyncClient(BaseClient):
     model: str = '',
     messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None,
     *,
-    tools: Optional[Sequence[Union[Mapping[str, Any], Tool]]] = None,
+    tools: Optional[Sequence[Union[Mapping[str, Any], Tool, Callable]]] = None,
     stream: Literal[False] = False,
-    format: Optional[Literal['', 'json']] = None,
+    think: Optional[Union[bool, Literal['low', 'medium', 'high']]] = None,
+    format: Optional[Union[Literal['', 'json'], JsonSchemaValue]] = None,
     options: Optional[Union[Mapping[str, Any], Options]] = None,
     keep_alive: Optional[Union[float, str]] = None,
   ) -> ChatResponse: ...
@@ -750,9 +797,10 @@ class AsyncClient(BaseClient):
     model: str = '',
     messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None,
     *,
-    tools: Optional[Sequence[Union[Mapping[str, Any], Tool]]] = None,
+    tools: Optional[Sequence[Union[Mapping[str, Any], Tool, Callable]]] = None,
     stream: Literal[True] = True,
-    format: Optional[Literal['', 'json']] = None,
+    think: Optional[Union[bool, Literal['low', 'medium', 'high']]] = None,
+    format: Optional[Union[Literal['', 'json'], JsonSchemaValue]] = None,
     options: Optional[Union[Mapping[str, Any], Options]] = None,
     keep_alive: Optional[Union[float, str]] = None,
   ) -> AsyncIterator[ChatResponse]: ...
@@ -762,14 +810,39 @@ class AsyncClient(BaseClient):
     model: str = '',
     messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None,
     *,
-    tools: Optional[Sequence[Union[Mapping[str, Any], Tool]]] = None,
+    tools: Optional[Sequence[Union[Mapping[str, Any], Tool, Callable]]] = None,
     stream: bool = False,
-    format: Optional[Literal['', 'json']] = None,
+    think: Optional[Union[bool, Literal['low', 'medium', 'high']]] = None,
+    format: Optional[Union[Literal['', 'json'], JsonSchemaValue]] = None,
     options: Optional[Union[Mapping[str, Any], Options]] = None,
     keep_alive: Optional[Union[float, str]] = None,
   ) -> Union[ChatResponse, AsyncIterator[ChatResponse]]:
     """
     Create a chat response using the requested model.
+
+    Args:
+      tools:
+        A JSON schema as a dict, an Ollama Tool or a Python Function.
+        Python functions need to follow Google style docstrings to be converted to an Ollama Tool.
+        For more information, see: https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings
+      stream: Whether to stream the response.
+      format: The format of the response.
+
+    Example:
+      def add_two_numbers(a: int, b: int) -> int:
+        '''
+        Add two numbers together.
+
+        Args:
+          a: First number to add
+          b: Second number to add
+
+        Returns:
+          int: The sum of a and b
+        '''
+        return a + b
+
+      await client.chat(model='llama3.2', tools=[add_two_numbers], messages=[...])
 
     Raises `RequestError` if a model is not provided.
 
@@ -784,9 +857,10 @@ class AsyncClient(BaseClient):
       '/api/chat',
       json=ChatRequest(
         model=model,
-        messages=[message for message in _copy_messages(messages)],
-        tools=[tool for tool in _copy_tools(tools)],
+        messages=list(_copy_messages(messages)),
+        tools=list(_copy_tools(tools)),
         stream=stream,
+        think=think,
         format=format,
         options=options,
         keep_alive=keep_alive,
@@ -925,10 +999,16 @@ class AsyncClient(BaseClient):
   async def create(
     self,
     model: str,
-    path: Optional[Union[str, PathLike]] = None,
-    modelfile: Optional[str] = None,
-    *,
     quantize: Optional[str] = None,
+    from_: Optional[str] = None,
+    files: Optional[Dict[str, str]] = None,
+    adapters: Optional[Dict[str, str]] = None,
+    template: Optional[str] = None,
+    license: Optional[Union[str, List[str]]] = None,
+    system: Optional[str] = None,
+    parameters: Optional[Union[Mapping[str, Any], Options]] = None,
+    messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None,
+    *,
     stream: Literal[False] = False,
   ) -> ProgressResponse: ...
 
@@ -936,20 +1016,32 @@ class AsyncClient(BaseClient):
   async def create(
     self,
     model: str,
-    path: Optional[Union[str, PathLike]] = None,
-    modelfile: Optional[str] = None,
-    *,
     quantize: Optional[str] = None,
+    from_: Optional[str] = None,
+    files: Optional[Dict[str, str]] = None,
+    adapters: Optional[Dict[str, str]] = None,
+    template: Optional[str] = None,
+    license: Optional[Union[str, List[str]]] = None,
+    system: Optional[str] = None,
+    parameters: Optional[Union[Mapping[str, Any], Options]] = None,
+    messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None,
+    *,
     stream: Literal[True] = True,
   ) -> AsyncIterator[ProgressResponse]: ...
 
   async def create(
     self,
     model: str,
-    path: Optional[Union[str, PathLike]] = None,
-    modelfile: Optional[str] = None,
-    *,
     quantize: Optional[str] = None,
+    from_: Optional[str] = None,
+    files: Optional[Dict[str, str]] = None,
+    adapters: Optional[Dict[str, str]] = None,
+    template: Optional[str] = None,
+    license: Optional[Union[str, List[str]]] = None,
+    system: Optional[str] = None,
+    parameters: Optional[Union[Mapping[str, Any], Options]] = None,
+    messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None,
+    *,
     stream: bool = False,
   ) -> Union[ProgressResponse, AsyncIterator[ProgressResponse]]:
     """
@@ -957,12 +1049,6 @@ class AsyncClient(BaseClient):
 
     Returns `ProgressResponse` if `stream` is `False`, otherwise returns a `ProgressResponse` generator.
     """
-    if (realpath := _as_path(path)) and realpath.exists():
-      modelfile = await self._parse_modelfile(realpath.read_text(), base=realpath.parent)
-    elif modelfile:
-      modelfile = await self._parse_modelfile(modelfile)
-    else:
-      raise RequestError('must provide either path or modelfile')
 
     return await self._request(
       ProgressResponse,
@@ -970,36 +1056,25 @@ class AsyncClient(BaseClient):
       '/api/create',
       json=CreateRequest(
         model=model,
-        modelfile=modelfile,
         stream=stream,
         quantize=quantize,
+        from_=from_,
+        files=files,
+        adapters=adapters,
+        license=license,
+        template=template,
+        system=system,
+        parameters=parameters,
+        messages=messages,
       ).model_dump(exclude_none=True),
       stream=stream,
     )
 
-  async def _parse_modelfile(self, modelfile: str, base: Optional[Path] = None) -> str:
-    base = Path.cwd() if base is None else base
-
-    out = io.StringIO()
-    for line in io.StringIO(modelfile):
-      command, _, args = line.partition(' ')
-      if command.upper() not in ['FROM', 'ADAPTER']:
-        print(line, end='', file=out)
-        continue
-
-      path = Path(args.strip()).expanduser()
-      path = path if path.is_absolute() else base / path
-      if path.exists():
-        args = f'@{await self._create_blob(path)}\n'
-      print(command, args, end='', file=out)
-
-    return out.getvalue()
-
-  async def _create_blob(self, path: Union[str, Path]) -> str:
+  async def create_blob(self, path: Union[str, Path]) -> str:
     sha256sum = sha256()
-    with open(path, 'rb') as r:
+    async with await anyio.open_file(path, 'rb') as r:
       while True:
-        chunk = r.read(32 * 1024)
+        chunk = await r.read(32 * 1024)
         if not chunk:
           break
         sha256sum.update(chunk)
@@ -1007,9 +1082,9 @@ class AsyncClient(BaseClient):
     digest = f'sha256:{sha256sum.hexdigest()}'
 
     async def upload_bytes():
-      with open(path, 'rb') as r:
+      async with await anyio.open_file(path, 'rb') as r:
         while True:
-          chunk = r.read(32 * 1024)
+          chunk = await r.read(32 * 1024)
           if not chunk:
             break
           yield chunk
@@ -1068,20 +1143,25 @@ class AsyncClient(BaseClient):
     )
 
 
+def _copy_images(images: Optional[Sequence[Union[Image, Any]]]) -> Iterator[Image]:
+  for image in images or []:
+    yield image if isinstance(image, Image) else Image(value=image)
+
+
 def _copy_messages(messages: Optional[Sequence[Union[Mapping[str, Any], Message]]]) -> Iterator[Message]:
   for message in messages or []:
     yield Message.model_validate(
-      {k: [Image(value=image) for image in v] if k == 'images' else v for k, v in dict(message).items() if v},
+      {k: list(_copy_images(v)) if k == 'images' else v for k, v in dict(message).items() if v},
     )
 
 
-def _copy_tools(tools: Optional[Sequence[Union[Mapping[str, Any], Tool]]]) -> Iterator[Tool]:
-  for tool in tools or []:
-    yield Tool.model_validate(tool)
+def _copy_tools(tools: Optional[Sequence[Union[Mapping[str, Any], Tool, Callable]]] = None) -> Iterator[Tool]:
+  for unprocessed_tool in tools or []:
+    yield convert_function_to_tool(unprocessed_tool) if callable(unprocessed_tool) else Tool.model_validate(unprocessed_tool)
 
 
 def _as_path(s: Optional[Union[str, PathLike]]) -> Union[Path, None]:
-  if isinstance(s, str) or isinstance(s, Path):
+  if isinstance(s, (str, Path)):
     try:
       if (p := Path(s)).exists():
         return p
@@ -1163,7 +1243,7 @@ def _parse_host(host: Optional[str]) -> str:
   elif scheme == 'https':
     port = 443
 
-  split = urllib.parse.urlsplit('://'.join([scheme, hostport]))
+  split = urllib.parse.urlsplit(f'{scheme}://{hostport}')
   host = split.hostname or '127.0.0.1'
   port = split.port or port
 

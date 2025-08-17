@@ -1,40 +1,104 @@
+import contextlib
 import json
-from base64 import b64encode
-from pathlib import Path
+from base64 import b64decode, b64encode
 from datetime import datetime
-from typing import (
-  Any,
-  Literal,
-  Mapping,
-  Optional,
-  Sequence,
-  Union,
-)
-from typing_extensions import Annotated
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from pydantic import (
   BaseModel,
   ByteSize,
+  ConfigDict,
   Field,
-  FilePath,
-  Base64Str,
   model_serializer,
 )
 from pydantic.json_schema import JsonSchemaValue
+from typing_extensions import Annotated, Literal
 
 
 class SubscriptableBaseModel(BaseModel):
   def __getitem__(self, key: str) -> Any:
-    return getattr(self, key)
+    """
+    >>> msg = Message(role='user')
+    >>> msg['role']
+    'user'
+    >>> msg = Message(role='user')
+    >>> msg['nonexistent']
+    Traceback (most recent call last):
+    KeyError: 'nonexistent'
+    """
+    if key in self:
+      return getattr(self, key)
+
+    raise KeyError(key)
 
   def __setitem__(self, key: str, value: Any) -> None:
+    """
+    >>> msg = Message(role='user')
+    >>> msg['role'] = 'assistant'
+    >>> msg['role']
+    'assistant'
+    >>> tool_call = Message.ToolCall(function=Message.ToolCall.Function(name='foo', arguments={}))
+    >>> msg = Message(role='user', content='hello')
+    >>> msg['tool_calls'] = [tool_call]
+    >>> msg['tool_calls'][0]['function']['name']
+    'foo'
+    """
     setattr(self, key, value)
 
   def __contains__(self, key: str) -> bool:
-    return hasattr(self, key)
+    """
+    >>> msg = Message(role='user')
+    >>> 'nonexistent' in msg
+    False
+    >>> 'role' in msg
+    True
+    >>> 'content' in msg
+    False
+    >>> msg.content = 'hello!'
+    >>> 'content' in msg
+    True
+    >>> msg = Message(role='user', content='hello!')
+    >>> 'content' in msg
+    True
+    >>> 'tool_calls' in msg
+    False
+    >>> msg['tool_calls'] = []
+    >>> 'tool_calls' in msg
+    True
+    >>> msg['tool_calls'] = [Message.ToolCall(function=Message.ToolCall.Function(name='foo', arguments={}))]
+    >>> 'tool_calls' in msg
+    True
+    >>> msg['tool_calls'] = None
+    >>> 'tool_calls' in msg
+    True
+    >>> tool = Tool()
+    >>> 'type' in tool
+    True
+    """
+    if key in self.model_fields_set:
+      return True
+
+    if value := self.__class__.model_fields.get(key):
+      return value.default is not None
+
+    return False
 
   def get(self, key: str, default: Any = None) -> Any:
-    return getattr(self, key, default)
+    """
+    >>> msg = Message(role='user')
+    >>> msg.get('role')
+    'user'
+    >>> msg = Message(role='user')
+    >>> msg.get('nonexistent')
+    >>> msg = Message(role='user')
+    >>> msg.get('nonexistent', 'default')
+    'default'
+    >>> msg = Message(role='user', tool_calls=[ Message.ToolCall(function=Message.ToolCall.Function(name='foo', arguments={}))])
+    >>> msg.get('tool_calls')[0]['function']['name']
+    'foo'
+    """
+    return getattr(self, key) if hasattr(self, key) else default
 
 
 class Options(SubscriptableBaseModel):
@@ -87,7 +151,7 @@ class BaseGenerateRequest(BaseStreamableRequest):
   options: Optional[Union[Mapping[str, Any], Options]] = None
   'Options to use for the request.'
 
-  format: Optional[Literal['', 'json']] = None
+  format: Optional[Union[Literal['', 'json'], JsonSchemaValue]] = None
   'Format of the response.'
 
   keep_alive: Optional[Union[float, str]] = None
@@ -95,16 +159,31 @@ class BaseGenerateRequest(BaseStreamableRequest):
 
 
 class Image(BaseModel):
-  value: Union[FilePath, Base64Str, bytes]
+  value: Union[str, bytes, Path]
 
-  # This overloads the `model_dump` method and returns values depending on the type of the `value` field
   @model_serializer
   def serialize_model(self):
-    if isinstance(self.value, Path):
-      return b64encode(self.value.read_bytes()).decode()
-    elif isinstance(self.value, bytes):
-      return b64encode(self.value).decode()
-    return self.value
+    if isinstance(self.value, (Path, bytes)):
+      return b64encode(self.value.read_bytes() if isinstance(self.value, Path) else self.value).decode()
+
+    if isinstance(self.value, str):
+      try:
+        if Path(self.value).exists():
+          return b64encode(Path(self.value).read_bytes()).decode()
+      except Exception:
+        # Long base64 string can't be wrapped in Path, so try to treat as base64 string
+        pass
+
+      # String might be a file path, but might not exist
+      if self.value.split('.')[-1] in ('png', 'jpg', 'jpeg', 'webp'):
+        raise ValueError(f'File {self.value} does not exist')
+
+      try:
+        # Try to decode to check if it's already base64
+        b64decode(self.value)
+        return self.value
+      except Exception:
+        raise ValueError('Invalid image data, expected base64 string or path to image file') from Exception
 
 
 class GenerateRequest(BaseGenerateRequest):
@@ -127,6 +206,9 @@ class GenerateRequest(BaseGenerateRequest):
 
   images: Optional[Sequence[Image]] = None
   'Image data for multimodal models.'
+
+  think: Optional[Union[bool, Literal['low', 'medium', 'high']]] = None
+  'Enable thinking mode (for thinking models).'
 
 
 class BaseGenerateResponse(SubscriptableBaseModel):
@@ -169,6 +251,9 @@ class GenerateResponse(BaseGenerateResponse):
   response: str
   'Response content. When streaming, this contains a fragment of the response.'
 
+  thinking: Optional[str] = None
+  'Thinking content. Only present when thinking is enabled.'
+
   context: Optional[Sequence[int]] = None
   'Tokenized history up to the point of the response.'
 
@@ -178,11 +263,14 @@ class Message(SubscriptableBaseModel):
   Chat message.
   """
 
-  role: Literal['user', 'assistant', 'system', 'tool']
+  role: str
   "Assumed role of the message. Response messages has role 'assistant' or 'tool'."
 
   content: Optional[str] = None
   'Content of the message. Response messages contains message fragments when streaming.'
+
+  thinking: Optional[str] = None
+  'Thinking content. Only present when thinking is enabled.'
 
   images: Optional[Sequence[Image]] = None
   """
@@ -195,6 +283,9 @@ class Message(SubscriptableBaseModel):
 
   Valid image formats depend on the model. See the model card for more information.
   """
+
+  tool_name: Optional[str] = None
+  'Name of the executed tool.'
 
   class ToolCall(SubscriptableBaseModel):
     """
@@ -222,28 +313,52 @@ class Message(SubscriptableBaseModel):
 
 
 class Tool(SubscriptableBaseModel):
-  type: Literal['function'] = 'function'
+  type: Optional[str] = 'function'
 
   class Function(SubscriptableBaseModel):
-    name: str
-    description: str
+    name: Optional[str] = None
+    description: Optional[str] = None
 
     class Parameters(SubscriptableBaseModel):
-      type: str
+      model_config = ConfigDict(populate_by_name=True)
+      type: Optional[Literal['object']] = 'object'
+      defs: Optional[Any] = Field(None, alias='$defs')
+      items: Optional[Any] = None
       required: Optional[Sequence[str]] = None
-      properties: Optional[JsonSchemaValue] = None
 
-    parameters: Parameters
+      class Property(SubscriptableBaseModel):
+        model_config = ConfigDict(arbitrary_types_allowed=True)
 
-  function: Function
+        type: Optional[Union[str, Sequence[str]]] = None
+        items: Optional[Any] = None
+        description: Optional[str] = None
+        enum: Optional[Sequence[Any]] = None
+
+      properties: Optional[Mapping[str, Property]] = None
+
+    parameters: Optional[Parameters] = None
+
+  function: Optional[Function] = None
 
 
 class ChatRequest(BaseGenerateRequest):
+  @model_serializer(mode='wrap')
+  def serialize_model(self, nxt):
+    output = nxt(self)
+    if output.get('tools'):
+      for tool in output['tools']:
+        if 'function' in tool and 'parameters' in tool['function'] and 'defs' in tool['function']['parameters']:
+          tool['function']['parameters']['$defs'] = tool['function']['parameters'].pop('defs')
+    return output
+
   messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None
   'Messages to chat with.'
 
   tools: Optional[Sequence[Tool]] = None
   'Tools to use for the chat.'
+
+  think: Optional[Union[bool, Literal['low', 'medium', 'high']]] = None
+  'Enable thinking mode (for thinking models).'
 
 
 class ChatResponse(BaseGenerateResponse):
@@ -315,13 +430,25 @@ class PushRequest(BaseStreamableRequest):
 
 
 class CreateRequest(BaseStreamableRequest):
+  @model_serializer(mode='wrap')
+  def serialize_model(self, nxt):
+    output = nxt(self)
+    if 'from_' in output:
+      output['from'] = output.pop('from_')
+    return output
+
   """
   Request to create a new model.
   """
-
-  modelfile: Optional[str] = None
-
   quantize: Optional[str] = None
+  from_: Optional[str] = None
+  files: Optional[Dict[str, str]] = None
+  adapters: Optional[Dict[str, str]] = None
+  template: Optional[str] = None
+  license: Optional[Union[str, List[str]]] = None
+  system: Optional[str] = None
+  parameters: Optional[Union[Mapping[str, Any], Options]] = None
+  messages: Optional[Sequence[Union[Mapping[str, Any], Message]]] = None
 
 
 class ModelDetails(SubscriptableBaseModel):
@@ -335,6 +462,7 @@ class ModelDetails(SubscriptableBaseModel):
 
 class ListResponse(SubscriptableBaseModel):
   class Model(SubscriptableBaseModel):
+    model: Optional[str] = None
     modified_at: Optional[datetime] = None
     digest: Optional[str] = None
     size: Optional[ByteSize] = None
@@ -393,6 +521,8 @@ class ShowResponse(SubscriptableBaseModel):
 
   parameters: Optional[str] = None
 
+  capabilities: Optional[List[str]] = None
+
 
 class ProcessResponse(SubscriptableBaseModel):
   class Model(SubscriptableBaseModel):
@@ -403,6 +533,7 @@ class ProcessResponse(SubscriptableBaseModel):
     size: Optional[ByteSize] = None
     size_vram: Optional[ByteSize] = None
     details: Optional[ModelDetails] = None
+    context_length: Optional[int] = None
 
   models: Sequence[Model]
 
@@ -424,12 +555,10 @@ class ResponseError(Exception):
   """
 
   def __init__(self, error: str, status_code: int = -1):
-    try:
-      # try to parse content as JSON and extract 'error'
-      # fallback to raw content if JSON parsing fails
+    # try to parse content as JSON and extract 'error'
+    # fallback to raw content if JSON parsing fails
+    with contextlib.suppress(json.JSONDecodeError):
       error = json.loads(error).get('error', error)
-    except json.JSONDecodeError:
-      ...
 
     super().__init__(error)
     self.error = error
@@ -437,3 +566,6 @@ class ResponseError(Exception):
 
     self.status_code = status_code
     'HTTP status code of the response.'
+
+  def __str__(self) -> str:
+    return f'{self.error} (status code: {self.status_code})'

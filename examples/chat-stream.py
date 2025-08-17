@@ -1,6 +1,5 @@
 from ollama import chat
 
-
 messages = [
   {
     'role': 'user',
@@ -8,8 +7,5 @@ messages = [
   },
 ]
 
-for part in chat('mistral', messages=messages, stream=True):
+for part in chat('gemma3', messages=messages, stream=True):
   print(part['message']['content'], end='', flush=True)
-
-# end with a newline
-print()
