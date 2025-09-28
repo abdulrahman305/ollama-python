@@ -382,6 +382,9 @@ class EmbedRequest(BaseRequest):
 
   keep_alive: Optional[Union[float, str]] = None
 
+  dimensions: Optional[int] = None
+  'Dimensions truncates the output embedding to the specified dimension.'
+
 
 class EmbedResponse(BaseGenerateResponse):
   """
@@ -536,6 +539,31 @@ class ProcessResponse(SubscriptableBaseModel):
     context_length: Optional[int] = None
 
   models: Sequence[Model]
+
+
+class WebSearchRequest(SubscriptableBaseModel):
+  query: str
+  max_results: Optional[int] = None
+
+
+class WebSearchResult(SubscriptableBaseModel):
+  content: Optional[str] = None
+  title: Optional[str] = None
+  url: Optional[str] = None
+
+
+class WebFetchRequest(SubscriptableBaseModel):
+  url: str
+
+
+class WebSearchResponse(SubscriptableBaseModel):
+  results: Sequence[WebSearchResult]
+
+
+class WebFetchResponse(SubscriptableBaseModel):
+  title: Optional[str] = None
+  content: Optional[str] = None
+  links: Optional[Sequence[str]] = None
 
 
 class RequestError(Exception):
